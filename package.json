@@ -1,0 +1,27 @@
+{
+  "name": "nodelogin",
+  "version": "1.2.0",
+  "description": "Advanced Login & Registration System",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "nodemon main.js"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bluebird": "^3.7.2",
+    "cookie-parser": "^1.4.4",
+    "dotenv": "^16.3.1",
+    "express": "^4.17.2",
+    "express-session": "^1.17.2",
+    "mysql": "^2.18.1",
+    "node-fetch": "2.x",
+    "nodemailer": "^6.7.2",
+    "nodemon": "^2.0.15",
+    "nunjucks": "^3.2.3",
+    "request": "^2.88.2",
+    "uuid": "^3.4.0"
+  },
+  "keywords": []
+}

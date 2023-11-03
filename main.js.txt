@@ -1,0 +1,1073 @@
+// Include the dependencies
+const mysql = require('mysql');
+const express = require('express');
+const session = require('express-session');
+const path = require('path');
+const nunjucks = require('nunjucks');
+const nodemailer = require('nodemailer');
+const uuidv1 = require('uuid/v1');
+const cookieParser = require('cookie-parser');
+const cryptography = require('crypto');
+const fs = require('fs');
+const fetch = require('node-fetch');
+const { Console } = require('console');
+// Unique secret key
+const secret_key = 'your secret key';
+// Update the below details with your own MySQL connection details
+const connection = mysql.createConnection({
+	host: 'localhost',
+	user: 'root',
+	password: '',
+	database: 'nodelogin',
+	multipleStatements: true
+});
+// Mail settings: Update the username and passowrd below to your email and pass, the current mail host is set to gmail, but you can change that if you want.
+const transporter = nodemailer.createTransport({
+	host: 'smtp.gmail.com',
+	port: 465,
+	secure: true,
+	auth: {
+		user: 'xxxxxx@xxxxxx.xxx',
+		pass: 'xxxxxx'
+	}
+});
+// Initialize express
+const app = express();
+// Configure nunjucks template engine
+const env = nunjucks.configure('views', {
+  	autoescape: true,
+  	express: app
+});
+env.addFilter('formatNumber', num => String(num).replace(/(.)(?=(\d{3})+$)/g,'$1,'));
+env.addFilter('formatDateTime', date => (new Date(date).toISOString()).slice(0, -1).split('.')[0]);
+// Use sessions and other dependencies
+app.use(session({
+	secret: secret_key,
+	resave: true,
+	saveUninitialized: true
+}));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static(path.join(__dirname, 'static')));
+app.use(cookieParser());
+
+// http://localhost:3000/ - display login page
+app.get(['/', '/login'], (request, response) => isLoggedin(request, () => {
+	// User is logged in, redirect to home page
+	response.redirect('/home');
+}, () => {
+	// Create CSRF token
+	let token = cryptography.randomBytes(20).toString('hex');
+	// Store token in session
+	request.session.token = token;
+	// User is not logged in, render login template
+	response.render('index.html', { token: token });
+}));
+// http://localhost:3000/ - authenticate the user
+app.post(['/', '/login'], (request, response) => init(request, settings => {
+	// Create variables and assign the post data
+	let username = request.body.username;
+	let password = request.body.password;
+	let hashedPassword = cryptography.createHash('sha1').update(request.body.password).digest('hex');
+	let token = request.body.token;
+	// Get client IP address
+	let ip = request.headers['x-forwarded-for'] || request.socket.remoteAddress;
+	// Bruteforce protection
+	if (settings['brute_force_protection'] == 'true') {
+		loginAttempts(ip, false, result => {
+			if (result && result['attempts_left'] <= 1) {
+				// No login attempts remaining
+				response.send('You cannot login right now! Please try again later!');
+				return response.end();				
+			}
+		});
+	}
+	// check if the data exists and is not empty
+	if (username && password) {
+		// Ensure the captured token matches the session token (CSRF Protection)
+		if (settings['csrf_protection'] == 'true' && token != request.session.token) {
+			// Incorrect token
+			response.send('Incorrect token provided!');
+			return response.end();			
+		}
+		// Select the account from the accounts table
+		connection.query('SELECT * FROM accounts WHERE username = ? AND password = ?', [username, hashedPassword], (error, accounts) => {
+			// If the account exists
+			if (accounts.length > 0) {
+				// Twofactor
+				if (settings['twofactor_protection'] == 'true' && accounts[0].ip != ip) {
+					request.session.tfa_id = accounts[0].id;
+					request.session.tfa_email = accounts[0].email;
+					response.send('tfa: twofactor');
+					return response.end();						
+				}
+				// Make sure account is activated
+				if (settings['account_activation'] == 'true' && accounts[0].activation_code != 'activated' && accounts[0].activation_code != '') {
+					response.send('Please activate your account to login!');
+					return response.end();					
+				}
+				// Account exists (username and password match)
+				// Create session variables
+				request.session.account_loggedin = true;
+				request.session.account_id = accounts[0].id;
+				request.session.account_username = accounts[0].username;
+				request.session.account_password = accounts[0].password;
+				request.session.account_role = accounts[0].role;
+				// If user selected the remember me option
+				if (request.body.rememberme) {
+					// Create cookie hash, will be used to check if user is logged in
+					let hash = accounts[0].rememberme ? accounts[0].rememberme : cryptography.createHash('sha1').update(username + password + secret_key).digest('hex');
+					// Num days until the cookie expires (user will log out)
+					let days = 90;
+					// Set the cookie
+					response.cookie('rememberme', hash, { maxAge: 1000*60*60*24*days, httpOnly: true });
+					// Update code in database
+					connection.query('UPDATE accounts SET rememberme = ? WHERE username = ?', [hash, username]);
+				}
+				// Delete login attempts
+				connection.query('DELETE FROM login_attempts WHERE ip_address = ?', [ip]);
+				// Output success and redirect to home page
+				response.send('success'); // do not change the message as the ajax code depends on it
+				return response.end();
+			} else {
+				// Bruteforce
+				if (settings['brute_force_protection'] == 'true') loginAttempts(ip);
+				// Incorrect username/password
+				response.send('Incorrect Username and/or Password!');
+				return response.end();
+			}
+		});
+	} else {
+		// Bruteforce
+		if (settings['brute_force_protection'] == 'true') loginAttempts(ip);
+		// Incorrect username/password
+		response.send('Incorrect Username and/or Password!');
+		return response.end();
+	}
+}));
+
+// http://localhost:3000/register - display the registration page
+app.get('/register', (request, response) => isLoggedin(request, () => {
+	// User is logged in, redirect to home page
+	response.redirect('/home');
+}, (settings) => {
+	// Create CSRF token
+	let token = cryptography.randomBytes(20).toString('hex');
+	// Store token in session
+	request.session.token = token;
+	// User is not logged in, render login template
+	response.render('register.html', { token: token, settings: settings });
+}));
+// http://localhost:3000/register - register user
+app.post('/register', (request, response) => init(request, settings => {
+	// Create variables and assign the POST data
+	let username = request.body.username;
+	let password = request.body.password;
+	let cpassword = request.body.cpassword;
+	let hashedPassword = cryptography.createHash('sha1').update(request.body.password).digest('hex');
+	let email = request.body.email;
+	let token = request.body.token;
+	// Get client IP address
+	let ip = request.headers['x-forwarded-for'] || request.socket.remoteAddress;
+	// Default role
+	let role = 'Member';
+	// Ensure the captured token matches the session token (CSRF Protection)
+	if (settings['csrf_protection'] == 'true' && token != request.session.token) {
+		// Incorrect token
+		response.send('Incorrect token provided!');
+		return response.end();			
+	}
+	// Validate captcha if enabled
+	if (settings['recaptcha'] == 'true') {
+		if (!request.body['g-recaptcha-response']) {
+			response.send('Invalid captcha!');
+			return response.end();			
+		} else {
+			fetch('https://www.google.com/recaptcha/api/siteverify?response=' + request.body['g-recaptcha-response'] + '&secret=' + settings['recaptcha_secret_key']).then(res => res.json()).then(body => {
+				if (body.success !== undefined && !body.success) {
+					response.send('Invalid captcha!');
+					return response.end();
+				}
+			});
+		}
+	}
+	// Check if the POST data exists and not empty
+	if (username && password && email) {
+		// Check if account exists already in the accounts table based on the username or email
+		connection.query('SELECT * FROM accounts WHERE username = ? OR email = ?', [username, email], (error, accounts, fields) => {
+			// Check if account exists and validate input data
+			if (accounts.length > 0) {
+				response.send('Account already exists with that username and/or email!');
+				response.end();
+			} else if (!/\S+@\S+\.\S+/.test(email)) {
+				response.send('Invalid email address!');
+				response.end();
+			} else if (!/[A-Za-z0-9]+/.test(username)) {
+				response.send('Username must contain only characters and numbers!');
+				response.end();
+			} else if (password != cpassword) {
+				response.send('Passwords do not match!');
+				response.end();
+			} else if (username.length < 5 || username.length > 20) {
+				response.send('Username must be between 5 and 20 characters long!');
+				response.end();
+			} else if (password.length < 5 || password.length > 20) {
+				response.send('Password must be between 5 and 20 characters long!');
+				response.end();
+			} else if (settings['account_activation'] == 'true') {
+				// Generate a random unique ID
+				let activationCode = uuidv1();
+				// Change the below domain to your domain
+				let activateLink = request.protocol + '://' + request.get('host') + '/activate/' + email + '/' + activationCode;
+				// Get the activation email template
+				let activationTemplate = fs.readFileSync(path.join(__dirname, 'views/activation-email-template.html'), 'utf8').replaceAll('%link%', activateLink);
+				// Change the below mail options
+		        let mailOptions = {
+		            from: settings['mail_from'], // "Your Name / Business name" <xxxxxx@gmail.com>
+		            to: email,
+		            subject: 'Account Activation Required',
+		            text: activationTemplate.replace(/<\/?[^>]+(>|$)/g, ''),
+		            html: activationTemplate
+		        };
+				// Insert account with activation code
+				connection.query('INSERT INTO accounts (username, password, email, activation_code, role, ip) VALUES (?, ?, ?, ?, ?, ?)', [username, hashedPassword, email, activationCode, role, ip], () => {
+					// Send activation email
+					transporter.sendMail(mailOptions, (error, info) => {
+			            if (error) {
+			                return console.log(error);
+			            }
+			            console.log('Message %s sent: %s', info.messageId, info.response);
+			        });
+					response.send('Please check your email to activate your account!');
+					response.end();
+				});
+			} else {
+				// Insert account
+				connection.query('INSERT INTO accounts (username, password, email, activation_code, role, ip) VALUES (?, ?, ?, "activated", ?, ?)', [username, hashedPassword, email, role, ip], (error, result) => {
+					// Registration success!
+					if (settings['auto_login_after_register'] == 'true') {
+						// Authenticate the user
+						request.session.account_loggedin = true;
+						request.session.account_id = result.insertId;
+						request.session.account_username = username;
+						request.session.account_password = hashedPassword;
+						request.session.account_role = role;				
+						response.send('autologin');
+						response.end();						
+					} else {
+						response.send('You have registered! You can now login!');
+						response.end();
+					}
+				});
+			}
+		});
+	} else {
+		// Form is not complete...
+		response.send('Please complete the registration form!');
+		response.end();
+	}
+}));
+
+// http://localhost:3000/activate/<email>/<code> - activate an account
+app.get('/activate/:email/:code', (request, response) => {
+	// Check if the email and activation code match in the database
+	connection.query('SELECT * FROM accounts WHERE email = ? AND activation_code = ?', [request.params.email, request.params.code], (error, accounts) => {
+		// If email and code are valid
+		if (accounts.length > 0) {
+			// Email and activation exist, update the activation code to "activated"
+			connection.query('UPDATE accounts SET activation_code = "activated" WHERE email = ? AND activation_code = ?', [request.params.email, request.params.code], () => {
+				// Authenticate the user
+				request.session.account_loggedin = true;
+				request.session.account_id = accounts[0].id;
+				request.session.account_username = accounts[0].username;
+				request.session.account_password = accounts[0].password;
+				request.session.account_role = accounts[0].role;
+				// Reditect to home page
+				response.redirect('/home');
+			});
+		} else {
+			// Render activate template and output message
+			response.render('activate.html', { msg: 'Incorrect email and/or activation code!' });
+		}
+	});
+});
+
+// http://localhost:3000/forgotpassword - user can use this page if they have forgotten their password
+app.get('/forgotpassword', (request, response) => {
+	// Render forgot password template and output message
+	response.render('forgotpassword.html');	
+});
+// http://localhost:3000/forgotpassword - update account details
+app.post('/forgotpassword', (request, response) => init(request, settings => {
+	// Render activate template and output message
+	if (request.body.email) {
+		// Retrieve account info from database that's associated with the captured email
+		connection.query('SELECT * FROM accounts WHERE email = ?', [request.body.email], (error, accounts) => {
+			// If account exists
+			if (accounts.length > 0) {
+				// Generate a random unique ID
+				let resetCode = uuidv1();
+				// Change the below domain to your domain
+				let resetLink = request.protocol + '://' + request.get('host') + '/resetpassword/' + request.body.email + '/' + resetCode;
+				console.log(resetLink);
+				// Change the below mail options
+		        let mailOptions = {
+		            from: settings['mail_from'], // "Your Name / Business name" <xxxxxx@gmail.com>
+		            to: request.body.email,
+		            subject: 'Password Reset',
+		            text: 'Please click the following link to reset your password: ' + resetLink,
+		            html: '<p>Please click the following link to reset your password: <a href="' + resetLink + '">' + resetLink + '</a></p>'
+		        };
+				// Update reset column in db
+				connection.query('UPDATE accounts SET reset = ? WHERE email = ?', [resetCode, request.body.email]);
+				// Send reset password email
+				transporter.sendMail(mailOptions, (error, info) => {
+					if (error) {
+						return console.log(error);
+					}
+					console.log('Message %s sent: %s', info.messageId, info.response);
+				});
+				// Render forgot password template
+				response.render('forgotpassword.html', { msg: 'Reset password link has been sent to your email!' });
+			} else {
+				// Render forgot password template
+				response.render('forgotpassword.html', { msg: 'An account with that email does not exist!' });	
+			}
+		});
+	}
+}));
+
+// http://localhost:3000/resetpassword - display the reset form
+app.get('/resetpassword/:email/:code', (request, response) => {
+	// Make sure the params are specified
+	if (request.params.email && request.params.code) {
+		// Retrieve account info from database that's associated with the captured email
+		connection.query('SELECT * FROM accounts WHERE email = ? AND reset = ?', [request.params.email, request.params.code], (error, accounts) => {
+			// Check if account exists
+			if (accounts.length > 0) {
+				// Render forgot password template
+				response.render('resetpassword.html', { email: request.params.email, code: request.params.code });	
+			} else {
+				response.send('Incorrect email and/or code provided!');
+				response.end();						
+			}
+		});
+	} else {
+		response.send('No email and/or code provided!');
+		response.end();		
+	}
+});
+// http://localhost:3000/resetpassword - update password
+app.post('/resetpassword/:email/:code', (request, response) => {
+	// Make sure the params are specified
+	if (request.params.email && request.params.code) {
+		// Retrieve account info from database that's associated with the captured email
+		connection.query('SELECT * FROM accounts WHERE email = ? AND reset = ?', [request.params.email, request.params.code], (error, accounts) => {
+			// Check if account exists
+			if (accounts.length > 0) {
+				// Output msg
+				let msg = '';
+				// Check if user submitted the form
+				if (request.body.npassword && request.body.cpassword) {
+					// Validation
+					if (request.body.npassword != request.body.cpassword) {
+						msg = 'Passwords do not match!';
+					} else if (request.body.npassword.length < 5 || request.body.npassword.length > 20) {
+						msg = 'Password must be between 5 and 20 characters long!';
+					} else {
+						// Success! Update password
+						msg = 'Your password has been reset! You can now <a href="/">login</a>!';
+						// Hash password
+						let hashedPassword = cryptography.createHash('sha1').update(request.body.npassword).digest('hex');
+						// Update password
+						connection.query('UPDATE accounts SET password = ?, reset = "" WHERE email = ?', [hashedPassword, request.params.email]);
+					}
+					// Render reset password template
+					response.render('resetpassword.html', { msg: msg, email: request.params.email, code: request.params.code });
+				} else {
+					msg = 'Password fields must not be empty!';
+					// Render reset password template
+					response.render('resetpassword.html', { msg: msg, email: request.params.email, code: request.params.code });
+				}	
+			} else {
+				response.send('Incorrect email and/or code provided!');
+				response.end();						
+			}
+		});
+	} else {
+		response.send('No email and/or code provided!');
+		response.end();		
+	}
+});
+
+// http://localhost:3000/twofactor - twofactor authentication
+app.get('/twofactor', (request, response) => init(request, settings => {
+	// Check if the tfa session variables are declared
+	if (request.session.tfa_id && request.session.tfa_email) {
+		// Generate a random unique ID
+		let twofactorCode = uuidv1();
+		// Get the twofactor email template
+		let twofactorTemplate = fs.readFileSync(path.join(__dirname, 'views/twofactor-email-template.html'), 'utf8').replaceAll('%code%', twofactorCode);
+		// Change the below mail options
+		let mailOptions = {
+			from: settings['mail_from'], // "Your Name / Business name" <xxxxxx@gmail.com>
+			to: request.session.tfa_email,
+			subject: 'Your Access Code',
+			text: twofactorTemplate.replace(/<\/?[^>]+(>|$)/g, ''),
+			html: twofactorTemplate
+		};
+		// Update tfa code column in db
+		connection.query('UPDATE accounts SET tfa_code = ? WHERE id = ?', [twofactorCode, request.session.tfa_id]);
+		// Send tfa email
+		transporter.sendMail(mailOptions, (error, info) => {
+			if (error) {
+				return console.log(error);
+			}
+			console.log('Message %s sent: %s', info.messageId, info.response);
+		});
+		// Render twofactor template
+		response.render('twofactor.html');	
+	} else {
+		// Redirect to login page
+		response.redirect('/');
+	}	
+}));
+// http://localhost:3000/twofactor - twofactor authentication
+app.post('/twofactor', (request, response) => {
+	// Check if the tfa session variables are declared
+	if (request.session.tfa_id && request.session.tfa_email) {
+		// Retrieve account info from database that's associated with the captured email
+		connection.query('SELECT * FROM accounts WHERE id = ? AND email = ?', [request.session.tfa_id, request.session.tfa_email], (error, accounts) => {
+			// Output msg
+			let msg = '';
+			// If accounts not empty
+			if (accounts.length > 0) {
+				// Check if user submitted the form
+				if (request.body.code) {
+					// Check if captured code and account code match
+					if (request.body.code == accounts[0]['tfa_code']) {
+						// Get client IP address
+						let ip = request.headers['x-forwarded-for'] || request.socket.remoteAddress;
+						// Update IP address in db
+						connection.query('UPDATE accounts SET ip = ? WHERE id = ?', [ip, request.session.tfa_id]);
+						// Authenticate the user
+						request.session.account_loggedin = true;
+						request.session.account_id = accounts[0].id;
+						request.session.account_username = accounts[0].username;
+						request.session.account_password = accounts[0].password;
+						request.session.account_role = accounts[0].role;
+						// Redirect to home page	
+						return response.redirect('/home');					
+					} else {
+						msg = 'Incorrect email and/or code!';
+					}
+				}
+			} else {
+				msg = 'Incorrect email and/or code!';
+			}
+			// Render twofactor template
+			response.render('twofactor.html', { msg: msg });	
+		});
+	} else {
+		// Redirect to login page
+		response.redirect('/');
+	}
+});
+
+// http://localhost:3000/home - display the home page
+app.get('/home', (request, response) => isLoggedin(request, settings => {
+	// Render home template
+	response.render('home.html', { username: request.session.account_username, role: request.session.account_role });
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/profile - display the profile page
+app.get('/profile', (request, response) => isLoggedin(request, settings => {
+	// Get all the users account details so we can populate them on the profile page
+	connection.query('SELECT * FROM accounts WHERE username = ?', [request.session.account_username], (error, accounts, fields) => {
+		// Format the registered date
+		accounts[0].registered = new Date(accounts[0].registered).toISOString().split('T')[0];
+		// Render profile page
+		response.render('profile.html', { account: accounts[0], role: request.session.account_role });
+	});
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/edit_profile - displat the edit profile page
+app.get('/edit_profile', (request, response) => isLoggedin(request, settings => {
+	// Get all the users account details so we can populate them on the profile page
+	connection.query('SELECT * FROM accounts WHERE username = ?', [request.session.account_username], (error, accounts, fields) => {
+		// Format the registered date
+		accounts[0].registered = new Date(accounts[0].registered).toISOString().split('T')[0];
+		// Render profile page
+		response.render('profile-edit.html', { account: accounts[0], role: request.session.account_role });
+	});
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+// http://localhost:3000/edit_profile - update account details
+app.post('/edit_profile', (request, response) => isLoggedin(request, settings => {
+	// Create variables for easy access
+	let username = request.body.username;
+	let password = request.body.password;
+	let cpassword = request.body.cpassword;
+	let hashedPassword = cryptography.createHash('sha1').update(request.body.password).digest('hex');
+	let email = request.body.email;
+	let errorMsg = '';
+	// Validation
+	if (password != cpassword) {
+		errorMsg = 'Passwords do not match!';
+	} else if (!/\S+@\S+\.\S+/.test(email)) {
+		errorMsg = 'Invalid email address!';
+	} else if (!/[A-Za-z0-9]+/.test(username)) {
+		errorMsg = 'Username must contain only characters and numbers!';
+	} else if (password != cpassword) {
+		errorMsg = 'Passwords do not match!';
+	} else if (username.length < 5 || username.length > 20) {
+		errorMsg = 'Username must be between 5 and 20 characters long!';
+	} else if (password && password.length < 5 || password.length > 20) {
+		errorMsg = 'Password must be between 5 and 20 characters long!';
+	} else if (username && email) {
+		// Get account details from database
+		connection.query('SELECT * FROM accounts WHERE username = ?', [username], (error, accounts, fields) => {
+			// Does the account require activation
+			let requiresActivation = false;
+			// Activation code
+			let activationCode = 'activated';
+			// Update the password
+			hashedPassword = !password ? request.session.account_password : hashedPassword;
+			// Check if account activation is required
+			if (settings['account_activation'] == 'true' && accounts.length > 0 && accounts[0].email != email) {
+				// Generate a random unique ID
+				activationCode = uuidv1();
+				// Change the below domain to your domain
+				let activateLink = request.protocol + '://' + request.get('host') + '/activate/' + email + '/' + activationCode;
+				// Change the below mail options
+				let mailOptions = {
+					from: '"Your Name / Business name" <xxxxxx@gmail.com>',
+					to: email,
+					subject: 'Account Activation Required',
+					text: 'Please click the following link to activate your account: ' + activateLink,
+					html: '<p>Please click the following link to activate your account: <a href="' + activateLink + '">' + activateLink + '</a></p>'
+				};
+				requiresActivation = true;
+			}
+			// Check if username exists
+			if (accounts.length > 0 && username != request.session.account_username) {
+				// Username exists
+				response.render('profile-edit.html', { account: accounts[0], msg: 'Username already exists!', role: request.session.account_role });
+			} else {
+				// Update account with new details
+				connection.query('UPDATE accounts SET username = ?, password = ?, email = ?, activation_code = ? WHERE username = ?', [username, hashedPassword, email, activationCode, request.session.account_username], () => {
+					// Update session with new username
+					request.session.account_username = username;
+					// Output message
+					let msg = 'Account Updated!';
+					// Account activation required?
+					if (requiresActivation) {
+						// Send activation email
+						transporter.sendMail(mailOptions, (error, info) => {
+							if (error) {
+								return console.log(error);
+							}
+							console.log('Message %s sent: %s', info.messageId, info.response);
+						});
+						// Update msg
+						msg = 'You have changed your email address! You need to re-activate your account! You will be automatically logged-out.';	
+						// Destroy session data
+						request.session.destroy();					
+					}
+					// Get account details from database
+					connection.query('SELECT * FROM accounts WHERE username = ?', [username], (error, accounts, fields) => {
+						// Render edit profile page
+						response.render('profile-edit.html', { account: accounts[0], msg: msg, role: request.session.account_role });
+					});
+				});
+			}
+		});
+	}
+	// Output error message if any
+	if (errorMsg) {
+		// Get account details from database
+		connection.query('SELECT * FROM accounts WHERE username = ?', [username], (error, accounts, fields) => {
+			// Render edit profile page
+			response.render('profile-edit.html', { account: accounts[0], msg: errorMsg, role: request.session.account_role });
+		});
+	}
+}));
+
+// http://localhost:3000/logout - Logout page
+app.get('/logout', (request, response) => {
+	// Destroy session data
+	request.session.destroy();
+	// Clear remember me cookie
+	response.clearCookie('rememberme');
+	// Redirect to login page
+	response.redirect('/');
+});
+
+// http://localhost:3000/admin/ - Admin dashboard page
+app.get('/admin/', (request, response) => isAdmin(request, settings => {
+	// Retrieve statistical data
+	connection.query('SELECT * FROM accounts WHERE cast(registered as DATE) = cast(now() as DATE) ORDER BY registered DESC; SELECT COUNT(*) AS total FROM accounts LIMIT 1; SELECT COUNT(*) AS total FROM accounts WHERE last_seen < date_sub(now(), interval 1 month) LIMIT 1; SELECT * FROM accounts WHERE last_seen > date_sub(now(), interval 1 day) ORDER BY last_seen DESC; SELECT COUNT(*) AS total FROM accounts WHERE last_seen > date_sub(now(), interval 1 month) LIMIT 1', (error, results, fields) => {
+		// Render dashboard template
+		response.render('admin/dashboard.html', { selected: 'dashboard', accounts: results[0], accounts_total: results[1][0], inactive_accounts: results[2][0], active_accounts: results[3], active_accounts2: results[4][0], timeElapsedString: timeElapsedString });
+	});
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/accounts - Admin accounts page
+app.get(['/admin/accounts', '/admin/accounts/:msg/:search/:status/:activation/:role/:order/:order_by/:page'], (request, response) => isAdmin(request, settings => {
+	// Params validation
+	let msg = request.params.msg == 'n0' ? '' : request.params.msg;
+	let search = request.params.search == 'n0' ? '' : request.params.search;
+	let status = request.params.status == 'n0' ? '' : request.params.status;
+	let activation = request.params.activation == 'n0' ? '' : request.params.activation;
+	let role = request.params.role == 'n0' ? '' : request.params.role;
+	let order = request.params.order == 'DESC' ? 'DESC' : 'ASC';
+	let order_by_whitelist = ['id','username','email','activation_code','role','registered','last_seen'];
+	let order_by = order_by_whitelist.includes(request.params.order_by) ? request.params.order_by : 'id';
+	// Number of accounts to show on each pagination page
+	let results_per_page = 20;
+	let page = request.params.page ? request.params.page : 1;
+	let param1 = (page - 1) * results_per_page;
+	let param2 = results_per_page;
+	let param3 = '%' + search + '%';
+	// SQL where clause
+	let where = '';
+	where += search ? 'WHERE (username LIKE ? OR email LIKE ?) ' : '';
+	// Add filters
+	if (status == 'active') {
+		where += where ? 'AND last_seen > date_sub(now(), interval 1 month) ' : 'WHERE last_seen > date_sub(now(), interval 1 month) ';
+	}
+	if (status == 'inactive') {
+		where += where ? 'AND last_seen < date_sub(now(), interval 1 month) ' : 'WHERE last_seen < date_sub(now(), interval 1 month) ';
+	}
+	if (activation == 'pending') {
+		where += where ? 'AND activation_code != "activated" ' : 'WHERE activation_code != "activated" ';
+	}
+	if (role) {
+		where += where ? 'AND role = ? ' : 'WHERE role = ? ';
+	}
+	// Params array and append specified params
+	let params = [];
+	if (search) {
+		params.push(param3, param3);
+	}
+	if (role) {
+		params.push(role);
+	}
+	// Fetch the total number of accounts
+	connection.query('SELECT COUNT(*) AS total FROM accounts ' + where, params, (error, results) => {
+		// Accounts total
+		let accounts_total = results[0]['total'];
+		// Append params to array
+		params.push(param1, param2);
+		// Retrieve all accounts from the database
+		connection.query('SELECT * FROM accounts ' + where + ' ORDER BY ' + order_by + ' ' + order + ' LIMIT ?,?', params, (error, accounts) => {
+			// Determine the URL
+			let url = '/admin/accounts/n0/' + (search ? search : 'n0') + '/' + (status ? status : 'n0') + '/' + (activation ? activation : 'n0') + '/' + (role ? role : 'n0');
+			// Determine message
+			if (msg) {
+				if (msg == 'msg1') {
+					msg = 'Account created successfully!';
+				} else if (msg == 'msg2') { 
+					msg = 'Account updated successfully!';
+				} else if (msg == 'msg3') {
+					msg = 'Account deleted successfully!';
+				}
+			}
+			// Render accounts template
+			response.render('admin/accounts.html', { selected: 'accounts', selectedChild: 'view', accounts: accounts, accounts_total: accounts_total, msg: msg, page: parseInt(page), search: search, status: status, activation: activation, role: role, order: order, order_by: order_by, results_per_page: results_per_page, url: url, timeElapsedString: timeElapsedString, Math: Math });
+		});
+	});
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/account - Admin edit/create account
+app.get(['/admin/account', '/admin/account/:id'], (request, response) => isAdmin(request, settings => {
+	// Default page (Create/Edit)
+    let page = request.params.id ? 'Edit' : 'Create';
+	// Current date
+	let d = new Date();
+    // Default input account values
+    let account = {
+        'username': '',
+        'password': '',
+        'email': '',
+        'activation_code': '',
+        'rememberme': '',
+        'role': 'Member',
+		'registered': (new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString()).slice(0, -1).split('.')[0],
+		'last_seen': (new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString()).slice(0, -1).split('.')[0]
+    };
+    let roles = ['Member', 'Admin'];
+    // GET request ID exists, edit account
+    if (request.params.id) {
+		connection.query('SELECT * FROM accounts WHERE id = ?', [request.params.id], (error, accounts) => {
+			account = accounts[0];
+			response.render('admin/account.html', { selected: 'accounts', selectedChild: 'manage', page: page, roles: roles, account: account });
+		});
+	} else {
+		response.render('admin/account.html', { selected: 'accounts', selectedChild: 'manage', page: page, roles: roles, account: account });
+	}
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/account - Admin edit/create account
+app.post(['/admin/account', '/admin/account/:id'], (request, response) => isAdmin(request, settings => {
+    // GET request ID exists, edit account
+    if (request.params.id) {
+        // Edit an existing account
+        page = 'Edit'
+        // Retrieve account by ID with the GET request ID
+		connection.query('SELECT * FROM accounts WHERE id = ?', [request.params.id], (error, accounts) => {
+			// If user submitted the form
+			if (request.body.submit) {
+				// update account
+				let password = accounts[0]['password']
+				// If password exists in POST request
+				if (request.body.password) {
+					password = cryptography.createHash('sha1').update(request.body.password).digest('hex');
+				}
+				// Update account details
+				connection.query('UPDATE accounts SET username = ?, password = ?, email = ?, activation_code = ?, rememberme = ?, role = ?, registered = ?, last_seen = ? WHERE id = ?', [request.body.username, password, request.body.email, request.body.activation_code, request.body.rememberme, request.body.role, request.body.registered, request.body.last_seen, request.params.id]);
+				// Redirect to admin accounts page
+				response.redirect('/admin/accounts/msg2/n0/n0/n0/n0/ASC/id/1');
+			} else if (request.body.delete) {
+				// delete account
+				response.redirect('/admin/account/delete/' + request.params.id);
+			}
+		});
+	} else if (request.body.submit) {
+		// Hash password
+		let password = cryptography.createHash('sha1').update(request.body.password).digest('hex');
+		// Create account
+		connection.query('INSERT INTO accounts (username,password,email,activation_code,rememberme,role,registered,last_seen) VALUES (?,?,?,?,?,?,?,?)', [request.body.username, password, request.body.email, request.body.activation_code, request.body.rememberme, request.body.role, request.body.registered, request.body.last_seen]);
+		// Redirect to admin accounts page
+		response.redirect('/admin/accounts/msg1/n0/n0/n0/n0/ASC/id/1');
+	}
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/account/delete/:id - Delete account based on the ID param
+app.get('/admin/account/delete/:id', (request, response) => isAdmin(request, settings => {
+    // GET request ID exists, delete account
+    if (request.params.id) {
+		connection.query('DELETE FROM accounts WHERE id = ?', [request.params.id]);
+		response.redirect('/admin/accounts/msg3/n0/n0/n0/n0/ASC/id/1');
+	}
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/roles - View accounts roles
+app.get('/admin/roles', (request, response) => isAdmin(request, settings => {
+	// Roles list
+	let roles_list = ['Member', 'Admin'];
+	// Select and group roles from the accounts table
+    connection.query('SELECT role, COUNT(*) as total FROM accounts GROUP BY role; SELECT role, COUNT(*) as total FROM accounts WHERE last_seen > date_sub(now(), interval 1 month) GROUP BY role; SELECT role, COUNT(*) as total FROM accounts WHERE last_seen < date_sub(now(), interval 1 month) GROUP BY role', (error, roles) => {
+		// Roles array
+		new_roles = {};
+		// Update the structure
+		for (const role in roles[0]) {
+			new_roles[roles[0][role]['role']] = roles[0][role]['total'];
+		}
+		for (const role in roles_list) {
+			if (!new_roles[roles_list[role]]) new_roles[roles_list[role]] = 0;
+		}
+		// Get the total number of active roles
+		new_roles_active = {};
+		for (const role in roles[1]) {
+			new_roles_active[roles[1][role]['role']] = roles[1][role]['total'];
+		}
+		// Get the total number of inactive roles
+		new_roles_inactive = {};
+		for (const role in roles[2]) {
+			new_roles_inactive[roles[2][role]['role']] = roles[2][role]['total'];
+		}
+		// Render roles template
+		response.render('admin/roles.html', { selected: 'roles', roles: new_roles, roles_active: new_roles_active, roles_inactive: new_roles_inactive });
+	});
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/emailtemplate - View email templates (GET)
+app.get(['/admin/emailtemplate', '/admin/emailtemplate/:msg'], (request, response) => isAdmin(request, settings => {
+	// Output message
+	let msg = request.params.msg;
+	// Read template files
+	const activation_email_template = fs.readFileSync(path.join(__dirname, 'views/activation-email-template.html'), 'utf8');
+	const twofactor_email_template = fs.readFileSync(path.join(__dirname, 'views/twofactor-email-template.html'), 'utf8');
+	// Determine message
+	if (msg == 'msg1') {
+		msg = 'Email templates updated successfully!';
+	} else {
+		msg = '';
+	}
+	// Render emails template
+	response.render('admin/emailtemplates.html', { selected: 'emailtemplate', msg: msg, activation_email_template: activation_email_template, twofactor_email_template: twofactor_email_template });
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/emailtemplate - Update email templates (POST)
+app.post(['/admin/emailtemplate', '/admin/emailtemplate/:msg'], (request, response) => isAdmin(request, settings => {
+	// If form submitted
+	if (request.body.activation_email_template && request.body.twofactor_email_template) {
+		// Update the template files
+		fs.writeFileSync(path.join(__dirname, 'views/activation-email-template.html'), request.body.activation_email_template);
+		fs.writeFileSync(path.join(__dirname, 'views/twofactor-email-template.html'), request.body.twofactor_email_template);
+		// Redirect and output message
+		response.redirect('/admin/emailtemplate/msg1');
+	}
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/settings - View settings (GET)
+app.get(['/admin/settings', '/admin/settings/:msg'], (request, response) => isAdmin(request, settings => {
+	// Output message
+	let msg = request.params.msg;
+	// Determine message
+	if (msg == 'msg1') {
+		msg = 'Settings updated successfully!';
+	} else {
+		msg = '';
+	}
+	// Retrieve settings
+	getSettings(settings => {
+		// Render settings template
+		response.render('admin/settings.html', { selected: 'settings', msg: msg, settings: settings, settingsFormatTabs: settingsFormatTabs, settingsFormatForm: settingsFormatForm });
+	});
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/settings - Update settings (POST)
+app.post(['/admin/settings', '/admin/settings/:msg'], (request, response) => isAdmin(request, settings => {
+	// Update settings
+	for (let item in request.body) {
+		let key = item;
+		let value = request.body[item];
+		if (value.includes('true')) {
+			value = 'true';
+		}
+		connection.query('UPDATE settings SET setting_value = ? WHERE setting_key = ?', [value, key]);
+	}
+	// Redirect and output message
+	response.redirect('/admin/settings/msg1');
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/myaccount - Redirect to edit account page
+app.get('/admin/myaccount', (request, response) => isAdmin(request, settings => {
+	// Redirect to edit account page
+	response.redirect('/admin/account/' + request.session.account_id);
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// http://localhost:3000/admin/about - View about page
+app.get('/admin/about', (request, response) => isAdmin(request, settings => {
+	// Render about template
+   	response.render('admin/about.html', { selected: 'about' });
+}, () => {
+	// Redirect to login page
+	response.redirect('/');
+}));
+
+// Function that checks whether the user is logged-in or not
+const isLoggedin = (request, callback, callback2) => {
+	// Check if the loggedin param exists in session
+	init(request, settings => {
+		if (request.session.account_loggedin) {
+			return callback !== undefined ? callback(settings) : false;
+		} else if (request.cookies.rememberme) {
+			// if the remember me cookie exists check if an account has the same value in the database
+			connection.query('SELECT * FROM accounts WHERE rememberme = ?', [request.cookies.rememberme], (error, accounts, fields) => {
+				if (accounts.length > 0) {
+					request.session.account_loggedin = true;
+					request.session.account_id = accounts[0].id;
+					request.session.account_username = accounts[0].username;
+					request.session.account_role = accounts[0].role;
+					request.session.account_password = accounts[0].password;
+					return callback !== undefined ? callback(settings) : false;
+				} else {
+					return callback2 !== undefined ? callback2(settings) : false;
+				}
+			});
+		} else {
+			return callback2 !== undefined ? callback2(settings) : false;
+		}
+	});
+};
+
+// Function is admin
+const isAdmin = (request, callback, callback2) => {
+	isLoggedin(request, () => {
+		if (request.session.account_role == 'Admin') {
+			callback();
+		} else {
+			callback2();
+		}
+	}, callback2);
+};
+
+// Function init - check loggedin and retrieve settings
+const init = (request, callback) => {
+	if (request.session.account_loggedin) {
+		// Update last seen date
+		let d = new Date();
+		let now = (new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString()).slice(0, -1).split('.')[0];
+		connection.query('UPDATE accounts SET last_seen = ? WHERE id = ?', [now, request.session.account_id]);
+	}
+	connection.query('SELECT * FROM settings', (error, settings) => {
+		if (error) throw error;
+		let settings_obj = {};
+		for (let i = 0; i < settings.length; i++) {
+			settings_obj[settings[i].setting_key] = settings[i].setting_value;
+		}
+		callback(settings_obj);
+	});
+};
+
+// LoginAttempts function - prevents bruteforce attacks
+const loginAttempts = (ip, update = true, callback) => {
+	// Get the current date
+	let d = new Date();
+	let now = (new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString()).slice(0, -1).split('.')[0];
+	// Update attempts left
+	if (update) {
+		connection.query('INSERT INTO login_attempts (ip_address, `date`) VALUES (?,?) ON DUPLICATE KEY UPDATE attempts_left = attempts_left - 1, `date` = VALUES(`date`)', [ip, now]);
+	}
+	// Retrieve the login attempts from the db
+	connection.query('SELECT * FROM login_attempts WHERE ip_address = ?', [ip], (error, results) => {
+		let login_attempts = [];
+		if (results.length > 0) {
+			// Determine expiration date
+			let expire = new Date(results[0].date);
+			expire.setDate(expire.getDate() + 1);
+			// If current date is greater than the expiration date
+			if (d.getTime() > expire.getTime()) {
+				// Delete attempts
+				connection.query('DELETE FROM login_attempts WHERE id_address = ?', [ip]);
+			} else {
+				login_attempts = results[0];
+			}
+		}
+		// Execute callback function
+		if (callback != undefined) callback(login_attempts);
+	});
+};
+
+// format settings key
+const settingsFormatKey = key => {
+    key = key.toLowerCase().replaceAll('_', ' ').replace('url', 'URL').replace('db ', 'Database ').replace(' pass', ' Password').replace(' user', ' Username').replace(/\b\w/g, l => l.toUpperCase());
+    return key;
+};
+
+// Format settings variables in HTML format
+const settingsFormatVarHtml = (key, value) => {
+	let html = '';
+	let type = 'text';
+	type = key == 'pass' ? 'password' : type;
+	type = ['true', 'false'].includes(value.toLowerCase()) ? 'checkbox' : type;
+	checked = value.toLowerCase() == 'true' ? ' checked' : '';
+	html += '<label for="' + key + '">' + settingsFormatKey(key) + '</label>';
+	if (type == 'checkbox') {
+		html += '<input type="hidden" name="' + key + '" value="false">';
+	}
+	html += '<input type="' + type + '" name="' + key + '" id="' + key + '" value="' + value + '" placeholder="' + settingsFormatKey(key) + '"' + checked + '>';
+	return html;
+};
+
+// Format settings tabs
+const settingsFormatTabs = tabs => {
+	let html = '';
+	html += '<div class="tabs">';
+	html += '<a href="#" class="active">General</a>';
+	for (let tab in tabs) {
+		html += '<a href="#">' + tabs[tab] + '</a>';
+	}
+	html += '</div>';
+	return html;
+};
+
+// Format settings form
+const settingsFormatForm = settings => {
+	let html = '';
+	html += '<div class="tab-content active">';
+	let category = '';
+	for (let setting in settings) {
+		if (category != '' && category != settings[setting]['category']) {
+			html += '</div><div class="tab-content">';
+		}
+		category = settings[setting]['category'];
+		html += settingsFormatVarHtml(settings[setting]['key'], settings[setting]['value']);
+	}
+	html += '</div>';
+	return html;
+};
+
+// Get settings from database
+const getSettings = callback => {
+	connection.query('SELECT * FROM settings ORDER BY id', (error, settings, fields) => {
+		settings2 = {};
+		for (let setting in settings) {
+			settings2[settings[setting]['setting_key']] = { 'key': settings[setting]['setting_key'], 'value': settings[setting]['setting_value'], 'category': settings[setting]['category'] };
+		}
+		callback(settings2);	
+	});
+};
+
+// Formate date to time elapsed string
+const timeElapsedString = date => {
+	let seconds = Math.floor((new Date() - new Date(String(date).replace(/-/g,'/'))) / 1000);
+	let interval = seconds / 31536000;
+	if (interval > 1) {
+	  	return Math.floor(interval) + ' years';
+	}
+	interval = seconds / 2592000;
+	if (interval > 1) {
+	  	return Math.floor(interval) + ' months';
+	}
+	interval = seconds / 86400;
+	if (interval > 1) {
+	  	return Math.floor(interval) + ' days';
+	}
+	interval = seconds / 3600;
+	if (interval > 1) {
+	  	return Math.floor(interval) + ' hours';
+	}
+	interval = seconds / 60;
+	if (interval > 1) {
+	  	return Math.floor(interval) + ' minutes';
+	}
+	return Math.floor(seconds) + ' seconds';
+};
+
+// Listen on port 3000 (http://localhost:3000/)
+app.listen(3000);
